@@ -5,6 +5,8 @@ import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -13,9 +15,9 @@ import com.example.veato.ui.theme.VeatoTheme
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.veato.data.repository.PollRepositoryImpl
-import com.example.veato.ui.main.MainActivity
-import com.example.veato.data.model.PollPhase
+import com.example.veato.data.di.DefaultRepositoryFactory
+import com.example.veato.data.facade.VoteFlowFacade
+import com.example.veato.ui.poll.model.PollPhaseUi
 import com.example.veato.ui.poll.Phase1VoteScreen
 import com.example.veato.ui.poll.Phase2VoteScreen
 import com.example.veato.ui.poll.PollResultScreen
@@ -52,23 +54,50 @@ fun PollSessionScreenPreview() {
 }
 
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PollSessionScreen(
     pollId: String
 ) {
     val context = LocalContext.current
     val userId = FirebaseAuth.getInstance().currentUser?.uid ?: "demo_user"
+    
+    // Use Factory Method pattern to create repository and facade
+    val repositoryFactory = remember { DefaultRepositoryFactory() }
+    val facade = remember { 
+        VoteFlowFacade(repositoryFactory.createPollRepository())
+    }
 
     val viewModel: PollViewModel = viewModel(
         factory = PollViewModelFactory(
-            repository = PollRepositoryImpl(),
+            facade = facade,
             userId = userId,
             pollId = pollId
         )
     )
     val state by viewModel.state.collectAsState()
+    val isPollClosed = state.poll?.phase == PollPhaseUi.CLOSED
 
-    if (state.isBusy) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Vote Session") },
+                navigationIcon = {
+                    // Hide back button when poll is closed (results screen)
+                    if (!isPollClosed) {
+                        IconButton(onClick = { (context as? ComponentActivity)?.finish() }) {
+                            Icon(
+                                imageVector = Icons.Default.ArrowBack,
+                                contentDescription = "Back"
+                            )
+                        }
+                    }
+                }
+            )
+        }
+    ) { paddingValues ->
+        Box(modifier = Modifier.padding(paddingValues)) {
+            if (state.isBusy) {
         Box(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center
@@ -78,31 +107,36 @@ fun PollSessionScreen(
     } else {
         val poll = state.poll
         when (poll?.phase) {
-            PollPhase.PHASE1 -> {
+            PollPhaseUi.PHASE1 -> {
                 Phase1VoteScreen(
                     state = state,
-                    onToggleApproval = { index ->
-                        if (!state.voted && !poll.hasCurrentUserLockedIn && state.rejectedCandidateIndex != index) {
-                            viewModel.modifySelectedIndices(index)
+                    onToggleApproval = { candidateName ->
+                        if (!state.voted && !poll.hasCurrentUserLockedIn) {
+                            viewModel.modifySelectedCandidates(candidateName)
                         }
                     },
-                    onRejectCandidate = { index ->
-                        viewModel.setRejectedCandidate(index)
+                    onRejectCandidate = { candidateName ->
+                        viewModel.setRejectedCandidate(candidateName)
                     },
                     onLockInVote = {
+                        android.util.Log.d("VoteSessionActivity", "Lock In button clicked - Phase 1")
                         viewModel.submitPhase1Vote()
                     },
-                    onTimeOver = { /* no-op: backend auto-closes; ViewModel observes status */ }
+                    onTimeOver = { /* no-op: backend auto-closes; ViewModel observes status */ },
+                    onClearVetoAnimation = {
+                        viewModel.clearVetoAnimation()
+                    },
+                    onAcknowledgeReview = {
+                        viewModel.acknowledgeReview()
+                    }
                 )
             }
-            PollPhase.PHASE2 -> {
+            PollPhaseUi.PHASE2 -> {
                 Phase2VoteScreen(
                     state = state,
-                    onSelectCandidate = { index ->
+                    onSelectCandidate = { candidateName ->
                         if (!state.voted && !poll.hasCurrentUserLockedIn) {
-                            // Clear previous selection and set new one (radio button behavior)
-                            viewModel.clearSelectedIndices()
-                            viewModel.modifySelectedIndices(index)
+                            viewModel.modifySelectedCandidates(candidateName)
                         }
                     },
                     onLockInVote = {
@@ -111,14 +145,12 @@ fun PollSessionScreen(
                     onTimeOver = { /* no-op: backend auto-closes; ViewModel observes status */ }
                 )
             }
-            PollPhase.CLOSED -> {
+            PollPhaseUi.CLOSED -> {
                 PollResultScreen(
                     state = state,
                     onBackToMain = {
-                        // Navigate back to TeamDetailActivity
-                        val intent = Intent(context, TeamDetailActivity::class.java)
-                        intent.putExtra("teamId", poll.teamId)
-                        intent.putExtra("teamName", poll.teamName)
+                        // Navigate back to My Teams page
+                        val intent = Intent(context, MyTeamsActivity::class.java)
                         context.startActivity(intent)
                         (context as? VoteSessionActivity)?.finish()
                     }
@@ -133,8 +165,9 @@ fun PollSessionScreen(
                 }
             }
         }
+        }
+        }
     }
-
 }
 
 

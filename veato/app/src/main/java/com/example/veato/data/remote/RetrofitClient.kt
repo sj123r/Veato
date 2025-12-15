@@ -13,11 +13,14 @@ import com.google.firebase.auth.FirebaseAuth
  */
 object RetrofitClient {
 
-    // Local backend (for development)
-    private const val BASE_URL = "http://10.0.2.2:5001/"
+    // Local backend - for physical device (use computer's IP address)
+    // private const val BASE_URL = "http://172.16.30.1:5001/"
+
+    // Local backend - for emulator (uncomment if using emulator)
+    // private const val BASE_URL = "http://10.0.2.2:5001/"
 
     // Production backend (uncomment when deploying)
-    // private const val BASE_URL = "https://veato-1.onrender.com/"
+    private const val BASE_URL = "https://veato-1.onrender.com/"
     
     private val loggingInterceptor = HttpLoggingInterceptor().apply {
         level = HttpLoggingInterceptor.Level.BODY
@@ -35,9 +38,9 @@ object RetrofitClient {
     private val okHttpClient = OkHttpClient.Builder()
         .addInterceptor(loggingInterceptor)
         .addInterceptor(authHeaderInterceptor)
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(120, TimeUnit.SECONDS)  // Increased for Render cold starts
+        .readTimeout(180, TimeUnit.SECONDS)     // Increased for LLM processing (3 minutes)
+        .writeTimeout(120, TimeUnit.SECONDS)    // Increased for larger payloads
         .build()
     
     private val retrofit = Retrofit.Builder()
@@ -47,4 +50,5 @@ object RetrofitClient {
         .build()
     
     val pollApiService: PollApiService = retrofit.create(PollApiService::class.java)
+    val checkEmailApiService: CheckEmailApiService = retrofit.create(CheckEmailApiService::class.java)
 }

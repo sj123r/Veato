@@ -60,15 +60,21 @@ class PollRepositoryImpl : PollRepository {
                         name = candidateResponse.name,
                         ranking = candidateResponse.ranking ?: 0,
                         voteCount = candidateResponse.voteCount ?: 0,
+                        phase1ApprovalCount = candidateResponse.phase1ApprovalCount ?: 0,
                         isRejected = candidateResponse.isRejected ?: false
                     )
                 )
             }
 
-            // Parse results/ranking from backend response
+            // Parse results from backend response (for closed polls)
             val resultsList = mutableListOf<Candidate>()
-            pollResponse.resultRanking?.forEach { rankingResponse ->
-                resultsList.add(Candidate(name = rankingResponse.name))
+            pollResponse.results?.forEach { resultResponse ->
+                resultsList.add(
+                    Candidate(
+                        name = resultResponse.name,
+                        voteCount = resultResponse.voteCount ?: 0
+                    )
+                )
             }
 
             // Parse phase from backend
@@ -91,7 +97,9 @@ class PollRepositoryImpl : PollRepository {
                 lockedInUserCount = pollResponse.lockedInUserCount ?: 0,
                 hasCurrentUserLockedIn = pollResponse.hasCurrentUserLockedIn ?: false,
                 candidates = candidatesList,
-                results = resultsList
+                results = resultsList,
+                needsReview = pollResponse.needsReview ?: false,
+                invalidatedCandidates = pollResponse.invalidatedCandidates ?: emptyList()
             )
         } catch (e: HttpException) {
             Log.e("PollRepository", "HTTP error fetching poll: ${e.message}")
@@ -156,31 +164,63 @@ class PollRepositoryImpl : PollRepository {
         }
     }
 
-    override suspend fun submitPhase1Vote(pollId: String, approvedIndices: List<Int>, rejectedIndex: Int?) {
+    override suspend fun submitPhase1Vote(pollId: String, approvedCandidateNames: List<String>, rejectedCandidateName: String?) {
         try {
-            // Get current poll to convert indices to candidate names
+            Log.d("PollRepository", "submitPhase1Vote called with pollId=$pollId, approved=$approvedCandidateNames, rejected=$rejectedCandidateName")
+
+            // Get current poll to validate phase
+            val poll = getPoll(pollId)
+            Log.d("PollRepository", "Current poll phase: ${poll.phase}")
+
+            if (poll.phase != com.example.veato.data.model.PollPhase.PHASE1) {
+                throw Exception("Poll is not in Phase 1")
+            }
+
+            // Validate rejected candidate still exists in visible candidates
+            val visibleCandidateNames = poll.candidates.map { it.name }
+            val validRejectedCandidate = if (rejectedCandidateName != null && rejectedCandidateName in visibleCandidateNames) {
+                rejectedCandidateName
+            } else {
+                Log.d("PollRepository", "Rejected candidate '$rejectedCandidateName' no longer exists in poll, clearing it")
+                null
+            }
+
+            // No conversion needed - already using names!
+            // Call backend API (with lockIn = true by default)
+            val request = Phase1VoteRequest(approvedCandidateNames, validRejectedCandidate, lockIn = true)
+            Log.d("PollRepository", "Calling API with request: $request")
+            val response = apiService.castPhase1Vote(pollId, request)
+            Log.d("PollRepository", "API response code: ${response.code()}, successful: ${response.isSuccessful}")
+
+            if (!response.isSuccessful) {
+                val errorBody = response.errorBody()?.string() ?: "Unknown error"
+                Log.e("PollRepository", "API error: ${response.code()} - $errorBody")
+                throw Exception("API call failed: ${response.code()} - $errorBody")
+            }
+
+            Log.d("PollRepository", "Phase 1 vote submitted successfully")
+
+        } catch (e: HttpException) {
+            Log.e("PollRepository", "HTTP error submitting Phase 1 vote: ${e.message}", e)
+            throw Exception("Failed to submit Phase 1 vote: ${e.message}")
+        } catch (e: Exception) {
+            Log.e("PollRepository", "Error submitting Phase 1 vote: ${e.message}", e)
+            throw e
+        }
+    }
+
+    override suspend fun rejectCandidateImmediately(pollId: String, rejectedCandidateName: String): Poll {
+        try {
+            // Get current poll to validate phase
             val poll = getPoll(pollId)
 
             if (poll.phase != com.example.veato.data.model.PollPhase.PHASE1) {
                 throw Exception("Poll is not in Phase 1")
             }
 
-            // Convert approved indices to names
-            val approvedCandidates = approvedIndices.mapNotNull { index ->
-                if (index in poll.candidates.indices) {
-                    poll.candidates[index].name
-                } else null
-            }
-
-            // Convert rejected index to name (if provided)
-            val rejectedCandidate = rejectedIndex?.let { index ->
-                if (index in poll.candidates.indices) {
-                    poll.candidates[index].name
-                } else null
-            }
-
-            // Call backend API
-            val request = Phase1VoteRequest(approvedCandidates, rejectedCandidate)
+            // No conversion needed - already using name!
+            // Call backend API with lockIn = false to reject without locking in
+            val request = Phase1VoteRequest(emptyList(), rejectedCandidateName, lockIn = false)
             val response = apiService.castPhase1Vote(pollId, request)
 
             if (!response.isSuccessful) {
@@ -188,33 +228,30 @@ class PollRepositoryImpl : PollRepository {
                 throw Exception("API call failed: ${response.code()} - $errorBody")
             }
 
+            // Fetch updated poll state to get the replacement candidate
+            return getPoll(pollId)
+
         } catch (e: HttpException) {
-            Log.e("PollRepository", "HTTP error submitting Phase 1 vote: ${e.message}")
-            throw Exception("Failed to submit Phase 1 vote: ${e.message}")
+            Log.e("PollRepository", "HTTP error rejecting candidate: ${e.message}")
+            throw Exception("Failed to reject candidate: ${e.message}")
         } catch (e: Exception) {
-            Log.e("PollRepository", "Error submitting Phase 1 vote: ${e.message}")
+            Log.e("PollRepository", "Error rejecting candidate: ${e.message}")
             throw e
         }
     }
 
-    override suspend fun submitPhase2Vote(pollId: String, selectedIndex: Int) {
+    override suspend fun submitPhase2Vote(pollId: String, selectedCandidateName: String) {
         try {
-            // Get current poll to convert index to candidate name
+            // Get current poll to validate phase
             val poll = getPoll(pollId)
 
             if (poll.phase != com.example.veato.data.model.PollPhase.PHASE2) {
                 throw Exception("Poll is not in Phase 2")
             }
 
-            // Convert index to name
-            val selectedCandidate = if (selectedIndex in poll.candidates.indices) {
-                poll.candidates[selectedIndex].name
-            } else {
-                throw Exception("Invalid candidate index")
-            }
-
+            // No conversion needed - already using name!
             // Call backend API
-            val request = Phase2VoteRequest(selectedCandidate)
+            val request = Phase2VoteRequest(selectedCandidateName)
             val response = apiService.castPhase2Vote(pollId, request)
 
             if (!response.isSuccessful) {

@@ -2,10 +2,10 @@ package com.example.veato
 
 import android.content.Intent
 import android.os.Bundle
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -31,14 +31,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.veato.ui.theme.VeatoTheme
+import com.example.veato.ui.components.VeatoBottomNavigationBar
+import com.example.veato.ui.components.NavigationScreen
+
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
 data class MemberDetail(
     val userId: String,
     val fullName: String,
+    val userName: String,
     val email: String,
     val isLeader: Boolean,
     val position: String? = null,
@@ -81,6 +86,8 @@ class TeamDetailActivity : ComponentActivity() {
         var showLeaveDialog by remember { mutableStateOf(false) }
         val currentUserId = auth.currentUser?.uid
         val isLeader = team?.leaderId == currentUserId
+        val snackbarHostState = remember { SnackbarHostState() }
+        val scope = rememberCoroutineScope()
 
         // Load team data
         LaunchedEffect(teamId) {
@@ -93,7 +100,9 @@ class TeamDetailActivity : ComponentActivity() {
                     isLoading = false
                 }
                 .addOnFailureListener {
-                    Toast.makeText(context, "Error loading team", Toast.LENGTH_SHORT).show()
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Error loading team")
+                    }
                     isLoading = false
                 }
         }
@@ -130,7 +139,10 @@ class TeamDetailActivity : ComponentActivity() {
                 )
             },
             bottomBar = {
-                BottomNavigationBar(currentScreen = "MyTeams")
+                VeatoBottomNavigationBar(currentScreen = NavigationScreen.TEAMS)
+            },
+            snackbarHost = {
+                SnackbarHost(hostState = snackbarHostState)
             }
         ) { paddingValues ->
             when {
@@ -154,6 +166,8 @@ class TeamDetailActivity : ComponentActivity() {
                     TeamDetailContent(
                         team = team!!,
                         paddingValues = paddingValues,
+                        snackbarHostState = snackbarHostState,
+                        scope = scope,
                         onStartPoll = {
                             val intent = Intent(context, VoteSettingActivity::class.java)
                             intent.putExtra("teamId", team!!.id)
@@ -167,7 +181,9 @@ class TeamDetailActivity : ComponentActivity() {
                                 intent.putExtra("pollId", pollId)
                                 context.startActivity(intent)
                             } else {
-                                Toast.makeText(context, "No active poll", Toast.LENGTH_SHORT).show()
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("No active poll")
+                                }
                             }
                         }
                     )
@@ -185,7 +201,7 @@ class TeamDetailActivity : ComponentActivity() {
                     TextButton(
                         onClick = {
                             showLeaveDialog = false
-                            leaveTeam(team!!)
+                            leaveTeam(team!!, snackbarHostState, scope)
                         }
                     ) {
                         Text("Leave team", color = MaterialTheme.colorScheme.error)
@@ -204,6 +220,8 @@ class TeamDetailActivity : ComponentActivity() {
     private fun TeamDetailContent(
         team: Team,
         paddingValues: PaddingValues,
+        snackbarHostState: SnackbarHostState,
+        scope: kotlinx.coroutines.CoroutineScope,
         onStartPoll: () -> Unit,
         onJoinPoll: () -> Unit
     ) {
@@ -217,18 +235,25 @@ class TeamDetailActivity : ComponentActivity() {
         var emailToAdd by remember { mutableStateOf("") }
         var showEditMemberDialog by remember { mutableStateOf<MemberDetail?>(null) }
         var showRemoveMemberDialog by remember { mutableStateOf<MemberDetail?>(null) }
+        var refreshTrigger by remember { mutableStateOf(0) }
+        var isAddingMember by remember { mutableStateOf(false) }
 
         // Load members with their details
-        LaunchedEffect(team.id) {
+        LaunchedEffect(team.id, refreshTrigger) {
             isLoadingMembers = true
             try {
+                // Reload team data to get latest member list
+                val latestTeamDoc = db.collection("teams").document(team.id).get().await()
+                val latestMembers = latestTeamDoc.get("members") as? List<*> ?: emptyList<Any>()
+
                 val memberInfoList = mutableListOf<MemberDetail>()
 
-                for (memberId in team.members) {
+                for (memberId in latestMembers.filterIsInstance<String>()) {
                     try {
                         // Fetch user document
                         val userDoc = db.collection("users").document(memberId).get().await()
                         val fullName = userDoc.getString("fullName") ?: userDoc.getString("username") ?: "Unknown"
+                        val userName = userDoc.getString("username") ?: ""
                         val email = userDoc.getString("email") ?: ""
 
                         // Fetch member_info from subcollection
@@ -246,6 +271,7 @@ class TeamDetailActivity : ComponentActivity() {
                             MemberDetail(
                                 userId = memberId,
                                 fullName = fullName,
+                                userName = userName,
                                 email = email,
                                 isLeader = memberId == team.leaderId,
                                 position = position,
@@ -267,7 +293,7 @@ class TeamDetailActivity : ComponentActivity() {
 
                 isLoadingMembers = false
             } catch (e: Exception) {
-                Toast.makeText(context, "Failed to load members", Toast.LENGTH_SHORT).show()
+                snackbarHostState.showSnackbar("Failed to load members")
                 isLoadingMembers = false
             }
         }
@@ -305,7 +331,7 @@ class TeamDetailActivity : ComponentActivity() {
                     icon = Icons.Default.PlayArrow,
                     label = "Start New Poll",
                     onClick = onStartPoll,
-                    containerColor = Color(0xFF4CAF50)
+                    containerColor = MaterialTheme.colorScheme.primary
                 )
             }
 
@@ -329,30 +355,41 @@ class TeamDetailActivity : ComponentActivity() {
                 onEmailChange = { emailToAdd = it },
                 isLeader = isLeader,
                 currentUserId = currentUserId,
-                onAddMember = { email ->
+                isAddingMember = isAddingMember,
+                onAddMember = { username ->
+                    // Prevent duplicate add operations
+                    if (isAddingMember) {
+                        return@TeamMembersSection
+                    }
+
                     // Add member logic
-                    if (email.isBlank()) {
-                        Toast.makeText(context, "Please enter an email", Toast.LENGTH_SHORT).show()
+                    if (username.isBlank()) {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Please enter a username")
+                        }
                         return@TeamMembersSection
                     }
 
-                    if (!email.contains("@")) {
-                        Toast.makeText(context, "Please enter a valid email", Toast.LENGTH_SHORT).show()
+                    // Check if user already in team by userName (case-insensitive)
+                    if (memberDetails.any { it.userName.equals(username.trim(), ignoreCase = true) }) {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("User already in team")
+                        }
                         return@TeamMembersSection
                     }
 
-                    if (memberDetails.any { it.email == email.trim() }) {
-                        Toast.makeText(context, "User already in team", Toast.LENGTH_SHORT).show()
-                        return@TeamMembersSection
-                    }
+                    isAddingMember = true
 
-                    // Query Firestore to find user by email
+                    // Query Firestore to find user by username
                     db.collection("users")
-                        .whereEqualTo("email", email.trim())
+                        .whereEqualTo("username", username.trim().lowercase())
                         .get()
                         .addOnSuccessListener { querySnapshot ->
                             if (querySnapshot.isEmpty) {
-                                Toast.makeText(context, "User not found with that email", Toast.LENGTH_SHORT).show()
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Username not found. Check the spelling or ask them to sign up.")
+                                }
+                                isAddingMember = false
                             } else {
                                 val userDoc = querySnapshot.documents[0]
                                 val userId = userDoc.id
@@ -361,17 +398,26 @@ class TeamDetailActivity : ComponentActivity() {
                                 db.collection("teams").document(team.id)
                                     .update("members", FieldValue.arrayUnion(userId))
                                     .addOnSuccessListener {
-                                        Toast.makeText(context, "Member added successfully", Toast.LENGTH_SHORT).show()
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar("Member added successfully")
+                                        }
                                         emailToAdd = ""
-                                        // Trigger reload by updating the team
+                                        refreshTrigger++  // Trigger reload
+                                        isAddingMember = false
                                     }
                                     .addOnFailureListener {
-                                        Toast.makeText(context, "Failed to add member", Toast.LENGTH_SHORT).show()
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar("Failed to add member")
+                                        }
+                                        isAddingMember = false
                                     }
                             }
                         }
                         .addOnFailureListener {
-                            Toast.makeText(context, "Error searching for user", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Error searching for user")
+                            }
+                            isAddingMember = false
                         }
                 },
                 onEditMember = { member ->
@@ -397,12 +443,16 @@ class TeamDetailActivity : ComponentActivity() {
                         .document(member.userId)
                         .set(mapOf("position" to position, "ageGroup" to ageGroup))
                         .addOnSuccessListener {
-                            Toast.makeText(context, "Member details updated", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Member details updated")
+                            }
                             showEditMemberDialog = null
-                            // Trigger reload
+                            refreshTrigger++  // Trigger reload
                         }
                         .addOnFailureListener {
-                            Toast.makeText(context, "Failed to update member", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Failed to update member")
+                            }
                         }
                 }
             )
@@ -418,12 +468,16 @@ class TeamDetailActivity : ComponentActivity() {
                     db.collection("teams").document(team.id)
                         .update("members", FieldValue.arrayRemove(member.userId))
                         .addOnSuccessListener {
-                            Toast.makeText(context, "Member removed", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Member removed")
+                            }
                             showRemoveMemberDialog = null
-                            // Trigger reload
+                            refreshTrigger++  // Trigger reload
                         }
                         .addOnFailureListener {
-                            Toast.makeText(context, "Failed to remove member", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Failed to remove member")
+                            }
                         }
                 }
             )
@@ -470,7 +524,7 @@ class TeamDetailActivity : ComponentActivity() {
                     modifier = Modifier
                         .size(10.dp)
                         .background(
-                            color = if (hasActivePoll) Color(0xFF4CAF50) else Color(0xFFF44336),
+                            color = if (hasActivePoll) MaterialTheme.colorScheme.primary else Color(0xFFF44336),
                             shape = CircleShape
                         )
                 )
@@ -489,7 +543,7 @@ class TeamDetailActivity : ComponentActivity() {
         icon: ImageVector,
         label: String,
         onClick: () -> Unit,
-        containerColor: Color = Color(0xFF4CAF50)
+        containerColor: Color = MaterialTheme.colorScheme.primary
     ) {
         Button(
             onClick = onClick,
@@ -522,6 +576,7 @@ class TeamDetailActivity : ComponentActivity() {
         onEmailChange: (String) -> Unit,
         isLeader: Boolean,
         currentUserId: String?,
+        isAddingMember: Boolean,
         onAddMember: (String) -> Unit,
         onEditMember: (MemberDetail) -> Unit,
         onRemoveMember: (MemberDetail) -> Unit
@@ -545,15 +600,24 @@ class TeamDetailActivity : ComponentActivity() {
                 OutlinedTextField(
                     value = emailToAdd,
                     onValueChange = onEmailChange,
-                    label = { Text("Enter member email") },
+                    label = { Text("Enter username") },
                     modifier = Modifier.weight(1f),
-                    singleLine = true
+                    singleLine = true,
+                    prefix = { Text("@") }
                 )
                 IconButton(
                     onClick = { onAddMember(emailToAdd) },
-                    modifier = Modifier.size(56.dp)
+                    modifier = Modifier.size(56.dp),
+                    enabled = !isAddingMember
                 ) {
-                    Icon(Icons.Default.Add, "Add member", modifier = Modifier.size(24.dp))
+                    if (isAddingMember) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(Icons.Default.Add, "Add member", modifier = Modifier.size(24.dp))
+                    }
                 }
             }
 
@@ -627,7 +691,7 @@ class TeamDetailActivity : ComponentActivity() {
                         )
                         if (member.isLeader) {
                             Surface(
-                                color = Color(0xFF4CAF50),
+                                color = MaterialTheme.colorScheme.primary,
                                 shape = MaterialTheme.shapes.small
                             ) {
                                 Text(
@@ -831,91 +895,18 @@ class TeamDetailActivity : ComponentActivity() {
         }
     }
 
-    @Composable
-    private fun BottomNavigationBar(currentScreen: String) {
-        val context = LocalContext.current
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(64.dp)
-                .background(Color(0xFFE8F5E9))
-                .padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // My Preferences
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(64.dp)
-                    .clickable {
-                        val intent = Intent(context, MyPreferencesActivity::class.java)
-                        context.startActivity(intent)
-                    }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "My Preferences",
-                    fontSize = 14.sp,
-                    fontWeight = if (currentScreen == "Preferences") FontWeight.Bold else FontWeight.Normal,
-                    color = Color.Black
-                )
-            }
-
-            // My Teams
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(64.dp)
-                    .clickable {
-                        val intent = Intent(context, MyTeamsActivity::class.java)
-                        context.startActivity(intent)
-                    }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "My Teams",
-                    fontSize = 14.sp,
-                    fontWeight = if (currentScreen == "MyTeams") FontWeight.Bold else FontWeight.Normal,
-                    color = Color.Black
-                )
-            }
-
-            // My Profile
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(64.dp)
-                    .clickable {
-                        val intent = Intent(context, ProfileActivity::class.java)
-                        context.startActivity(intent)
-                    }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "My Profile",
-                    fontSize = 14.sp,
-                    fontWeight = if (currentScreen == "Profile") FontWeight.Bold else FontWeight.Normal,
-                    color = Color.Black
-                )
-            }
-        }
-    }
-
-    private fun leaveTeam(team: Team) {
+    private fun leaveTeam(team: Team, snackbarHostState: SnackbarHostState, scope: kotlinx.coroutines.CoroutineScope) {
         val uid = auth.currentUser?.uid ?: return
         db.collection("teams").document(team.id)
             .update("members", FieldValue.arrayRemove(uid))
             .addOnSuccessListener {
-                Toast.makeText(this, "Left ${team.name}", Toast.LENGTH_SHORT).show()
+                // Don't show snackbar since we're finishing the activity immediately
                 finish()
             }
             .addOnFailureListener {
-                Toast.makeText(this, "Failed to leave team", Toast.LENGTH_SHORT).show()
+                scope.launch {
+                    snackbarHostState.showSnackbar("Failed to leave team")
+                }
             }
     }
 }

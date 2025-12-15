@@ -2,10 +2,10 @@ package com.example.veato
 
 import android.content.Intent
 import android.os.Bundle
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -23,10 +23,15 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.example.veato.ui.theme.VeatoTheme
+import com.example.veato.ui.components.VeatoBottomNavigationBar
+import com.example.veato.ui.components.NavigationScreen
+import com.example.veato.ui.components.EXTRA_FROM_TAB_INDEX
+
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
+import kotlinx.coroutines.launch
 
 class MyTeamsActivity : ComponentActivity() {
 
@@ -37,6 +42,9 @@ class MyTeamsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Apply transition animation based on tab direction
+        applyTabTransition()
 
         adapter = TeamAdapter(
             teamsList,
@@ -62,6 +70,8 @@ class MyTeamsActivity : ComponentActivity() {
     fun MyTeamsScreen() {
         val context = LocalContext.current
         var showCreateDialog by remember { mutableStateOf(false) }
+        val snackbarHostState = remember { SnackbarHostState() }
+        val scope = rememberCoroutineScope()
 
         Scaffold(
             topBar = {
@@ -79,7 +89,7 @@ class MyTeamsActivity : ComponentActivity() {
                                 showCreateDialog = true
                             },
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFF4CAF50)
+                                containerColor = MaterialTheme.colorScheme.primary
                             ),
                             modifier = Modifier.padding(end = 8.dp)
                         ) {
@@ -91,7 +101,10 @@ class MyTeamsActivity : ComponentActivity() {
                 )
             },
             bottomBar = {
-                BottomNavigationBar(currentScreen = "MyTeams")
+                VeatoBottomNavigationBar(currentScreen = NavigationScreen.TEAMS)
+            },
+            snackbarHost = {
+                SnackbarHost(hostState = snackbarHostState)
             }
         ) { paddingValues ->
             // RecyclerView wrapped in AndroidView
@@ -115,6 +128,8 @@ class MyTeamsActivity : ComponentActivity() {
         // Create Team Dialog
         if (showCreateDialog) {
             CreateTeamDialog(
+                snackbarHostState = snackbarHostState,
+                scope = scope,
                 onDismiss = { showCreateDialog = false },
                 onTeamCreated = { showCreateDialog = false }
             )
@@ -124,12 +139,27 @@ class MyTeamsActivity : ComponentActivity() {
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     private fun CreateTeamDialog(
+        snackbarHostState: SnackbarHostState,
+        scope: kotlinx.coroutines.CoroutineScope,
         onDismiss: () -> Unit,
         onTeamCreated: () -> Unit
     ) {
         val context = LocalContext.current
         var teamName by remember { mutableStateOf("") }
         var isCreating by remember { mutableStateOf(false) }
+        var duplicateError by remember { mutableStateOf(false) }
+
+        // Check for duplicate team names (case-insensitive, trimmed)
+        LaunchedEffect(teamName) {
+            val trimmedName = teamName.trim()
+            if (trimmedName.isNotEmpty()) {
+                duplicateError = teamsList.any {
+                    it.name.trim().equals(trimmedName, ignoreCase = true)
+                }
+            } else {
+                duplicateError = false
+            }
+        }
 
         AlertDialog(
             onDismissRequest = onDismiss,
@@ -144,7 +174,7 @@ class MyTeamsActivity : ComponentActivity() {
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     // Team Name Input
                     OutlinedTextField(
@@ -152,7 +182,11 @@ class MyTeamsActivity : ComponentActivity() {
                         onValueChange = { teamName = it },
                         label = { Text("Team Name") },
                         modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
+                        singleLine = true,
+                        isError = duplicateError,
+                        supportingText = if (duplicateError) {
+                            { Text("A team with that name already exists.", color = MaterialTheme.colorScheme.error) }
+                        } else null
                     )
                 }
             },
@@ -163,12 +197,24 @@ class MyTeamsActivity : ComponentActivity() {
                         val uid = auth.currentUser?.uid
 
                         if (name.isEmpty()) {
-                            Toast.makeText(context, "Please enter a team name", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Please enter a team name")
+                            }
                             return@Button
                         }
 
                         if (uid == null) {
-                            Toast.makeText(context, "You must be logged in", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                snackbarHostState.showSnackbar("You must be logged in")
+                            }
+                            return@Button
+                        }
+
+                        // Double-check for duplicates (case-insensitive, trimmed)
+                        if (teamsList.any { it.name.trim().equals(name, ignoreCase = true) }) {
+                            scope.launch {
+                                snackbarHostState.showSnackbar("A team with that name already exists.")
+                            }
                             return@Button
                         }
 
@@ -184,18 +230,22 @@ class MyTeamsActivity : ComponentActivity() {
 
                         teamRef.set(team)
                             .addOnSuccessListener {
-                                Toast.makeText(context, "Team '$name' created!", Toast.LENGTH_SHORT).show()
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Team '$name' created!")
+                                }
                                 isCreating = false
                                 onTeamCreated()
                             }
                             .addOnFailureListener { e ->
-                                Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Failed: ${e.message}")
+                                }
                                 isCreating = false
                             }
                     },
-                    enabled = !isCreating,
+                    enabled = !isCreating && !duplicateError,
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF4CAF50)
+                        containerColor = MaterialTheme.colorScheme.primary
                     )
                 ) {
                     if (isCreating) {
@@ -220,79 +270,6 @@ class MyTeamsActivity : ComponentActivity() {
         )
     }
 
-    @Composable
-    private fun BottomNavigationBar(currentScreen: String) {
-        val context = LocalContext.current
-
-        // Exact match to ProfileActivity navigation
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(64.dp)
-                .background(Color(0xFFE8F5E9))
-                .padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // My Preferences
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(64.dp)
-                    .clickable {
-                        val intent = Intent(context, MyPreferencesActivity::class.java)
-                        context.startActivity(intent)
-                    }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "My Preferences",
-                    fontSize = 14.sp,
-                    fontWeight = if (currentScreen == "Preferences") FontWeight.Bold else FontWeight.Normal,
-                    color = Color.Black
-                )
-            }
-
-            // My Teams
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(64.dp)
-                    .clickable { /* Already on My Teams */ }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "My Teams",
-                    fontSize = 14.sp,
-                    fontWeight = if (currentScreen == "MyTeams") FontWeight.Bold else FontWeight.Normal,
-                    color = Color.Black
-                )
-            }
-
-            // My Profile
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(64.dp)
-                    .clickable {
-                        val intent = Intent(context, ProfileActivity::class.java)
-                        context.startActivity(intent)
-                    }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "My Profile",
-                    fontSize = 14.sp,
-                    fontWeight = if (currentScreen == "Profile") FontWeight.Bold else FontWeight.Normal,
-                    color = Color.Black
-                )
-            }
-        }
-    }
-
     private fun loadTeams() {
         val uid = auth.currentUser?.uid ?: return
         db.collection("teams")
@@ -300,7 +277,7 @@ class MyTeamsActivity : ComponentActivity() {
             .orderBy("createdAt", Query.Direction.DESCENDING)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
-                    Toast.makeText(this, "Error loading teams", Toast.LENGTH_SHORT).show()
+                    //Toast.makeText(this, "Error loading teams", Toast.LENGTH_SHORT).show()
                     return@addSnapshotListener
                 }
 
@@ -318,5 +295,20 @@ class MyTeamsActivity : ComponentActivity() {
         intent.putExtra("teamId", team.id)
         intent.putExtra("teamName", team.name)
         startActivity(intent)
+    }
+
+    private fun applyTabTransition() {
+        val fromIndex = intent.getIntExtra(EXTRA_FROM_TAB_INDEX, -1)
+        val toIndex = NavigationScreen.TEAMS.index
+
+        if (fromIndex != -1) {
+            if (toIndex > fromIndex) {
+                // Moving right: slide content from right to left
+                overridePendingTransition(R.anim.slide_in_right, R.anim.slide_out_left)
+            } else if (toIndex < fromIndex) {
+                // Moving left: slide content from left to right
+                overridePendingTransition(R.anim.slide_in_left, R.anim.slide_out_right)
+            }
+        }
     }
 }
